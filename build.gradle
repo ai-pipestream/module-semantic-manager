@@ -79,6 +79,7 @@ dependencies {
     testImplementation 'io.quarkus:quarkus-junit5'
     testImplementation 'io.quarkus:quarkus-junit5-mockito'
     testImplementation 'io.rest-assured:rest-assured'
+    testImplementation 'ai.pipestream:pipestream-test-support'
 
     runtimeOnly libs.quarkus.logging.manager
 }

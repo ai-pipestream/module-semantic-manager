@@ -1,0 +1,28 @@
+name: Docker Hub Publish
+
+on:
+  repository_dispatch:
+    types: [dockerhub-publish]
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base GHCR image'
+        required: true
+        default: 'ghcr.io/ai-pipestream/module-semantic-manager'
+      dockerhub_repo:
+        description: 'Docker Hub repository'
+        required: true
+        default: 'pipestreamai/module-semantic-manager'
+      tags:
+        description: 'Space-separated tags'
+        required: true
+        default: 'latest'
+
+jobs:
+  push-to-dockerhub:
+    uses: ai-pipestream/.github/.github/workflows/reusable-dockerhub-publish.yml@main
+    with:
+      base_image: ${{ github.event.client_payload.base_image || inputs.base_image }}
+      dockerhub_repo: ${{ github.event.client_payload.dockerhub_repo || inputs.dockerhub_repo }}
+      tags: ${{ github.event.client_payload.tags || inputs.tags }}
+    secrets: inherit

@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 /**
@@ -31,7 +32,7 @@ import java.util.stream.Collectors;
  * In both cases, the orchestrator:
  * - Deduplicates chunking work by (chunker_config, source_text_key)
  * - Fans out to parallel chunker streams
- * - Pipelines chunks to embedder streams
+ * - **Pipelines** chunks to embedder streams as they arrive (no buffering)
  * - Assembles SemanticProcessingResult entries on the enriched PipeDoc
  */
 @ApplicationScoped
@@ -125,7 +126,7 @@ public class SemanticIndexingOrchestrator {
         log.info("Directive orchestration: {} chunking groups for doc: {}", chunkingGroups.size(), docId);
 
         // Process each chunking group
-        List<Uni<List<SemanticProcessingResult>>> groupUnis = new ArrayList<>();
+        List<Uni<List<AssemblyOutput>>> groupUnis = new ArrayList<>();
         for (DirectiveChunkingGroup group : chunkingGroups.values()) {
             groupUnis.add(processDirectiveGroup(inputDoc, group, nodeId));
         }
@@ -133,13 +134,23 @@ public class SemanticIndexingOrchestrator {
         return combineResults(inputDoc, groupUnis);
     }
 
-    private Uni<List<SemanticProcessingResult>> processDirectiveGroup(
+    /**
+     * Processes one directive chunking group with true end-to-end pipelining.
+     * The chunker stream is broadcast to all embedder streams simultaneously —
+     * Chunk #1 starts embedding while Chunk #2 is still being split.
+     *
+     * Uses Multi.toHotStream().broadcast() so a single chunker stream fans out
+     * to N embedder streams with zero buffering. Each embedder independently
+     * transforms chunks → embedding requests and collects responses.
+     */
+    private Uni<List<AssemblyOutput>> processDirectiveGroup(
             PipeDoc inputDoc, DirectiveChunkingGroup group, String nodeId) {
 
         String docId = inputDoc.getDocId();
         String requestId = UUID.randomUUID().toString();
+        List<EmbedderTarget> targets = group.embedderTargets();
 
-        // Build chunking request with the chunker's native config
+        // Build chunking request
         StreamChunksRequest.Builder reqBuilder = StreamChunksRequest.newBuilder()
                 .setRequestId(requestId)
                 .setDocId(docId)
@@ -151,105 +162,66 @@ public class SemanticIndexingOrchestrator {
             reqBuilder.setChunkerConfig(group.chunkerConfig());
         }
 
-        return chunkerStreamClient.streamChunks(reqBuilder.build())
-                .collect().asList()
-                .chain(chunks -> {
-                    if (chunks.isEmpty()) {
-                        log.warn("Chunker returned no chunks for configId={}, source={}, doc={}",
-                                group.chunkerConfigId(), group.sourceLabel(), docId);
-                        return Uni.createFrom().item(Collections.<SemanticProcessingResult>emptyList());
+        // Open the chunker stream and broadcast to all embedders.
+        // Side-collect chunks for result assembly (CopyOnWriteArrayList for thread safety).
+        List<StreamChunksResponse> collectedChunks = new CopyOnWriteArrayList<>();
+
+        Multi<StreamChunksResponse> chunkStream = chunkerStreamClient.streamChunks(reqBuilder.build())
+                .onItem().invoke(collectedChunks::add);
+
+        // Broadcast: each embedder subscribes to the same chunk stream.
+        // broadcast().toAtLeast(N) waits for N subscribers before items flow,
+        // guaranteeing every embedder sees every chunk.
+        Multi<StreamChunksResponse> broadcast = chunkStream
+                .broadcast().toAtLeast(targets.size());
+
+        // Wire up all embedder pipelines concurrently
+        List<Uni<AssemblyOutput>> embedderUnis = new ArrayList<>();
+        for (EmbedderTarget target : targets) {
+            String resultSetName = resolveResultSetName(target.template(), group.sourceLabel(),
+                    group.chunkerConfigId(), target.embedderConfigId());
+
+            // Each subscriber gets the full chunk stream and pipelines to its embedder
+            Multi<StreamEmbeddingsRequest> embeddingRequests = broadcast
+                    .map(chunk -> {
+                        StreamEmbeddingsRequest.Builder builder = StreamEmbeddingsRequest.newBuilder()
+                                .setRequestId(requestId)
+                                .setDocId(docId)
+                                .setChunkId(chunk.getChunkId())
+                                .setTextContent(chunk.getTextContent())
+                                .setChunkConfigId(group.chunkerConfigId())
+                                .setEmbeddingModelId(target.embedderConfigId());
+                        if (target.embedderConfig() != null) {
+                            builder.setEmbedderConfig(target.embedderConfig());
+                        }
+                        return builder.build();
+                    });
+
+            embedderUnis.add(
+                    embedderStreamClient.streamEmbeddings(embeddingRequests)
+                            .collect().asList()
+                            .map(responses -> assembleResult(
+                                    collectedChunks, responses, group.sourceLabel(),
+                                    group.chunkerConfigId(), target.embedderConfigId(),
+                                    resultSetName, nodeId))
+                            .onFailure().recoverWithItem(error -> {
+                                log.error("Embedder {} failed for doc {}: {}",
+                                        target.embedderConfigId(), docId, error.getMessage());
+                                return null;
+                            })
+            );
+        }
+
+        return Uni.combine().all().unis(embedderUnis)
+                .with(results -> {
+                    List<AssemblyOutput> nonNull = new ArrayList<>();
+                    for (Object r : results) {
+                        if (r != null) {
+                            nonNull.add((AssemblyOutput) r);
+                        }
                     }
-
-                    log.info("Received {} chunks for configId={}, source={}. Fanning out to {} embedders.",
-                            chunks.size(), group.chunkerConfigId(), group.sourceLabel(),
-                            group.embedderTargets().size());
-
-                    List<Uni<SemanticProcessingResult>> embedderUnis = new ArrayList<>();
-                    for (EmbedderTarget target : group.embedderTargets()) {
-                        String resultSetName = target.template()
-                                .replace("{source_label}", group.sourceLabel())
-                                .replace("{chunker_id}", group.chunkerConfigId())
-                                .replace("{embedder_id}", target.embedderConfigId());
-
-                        embedderUnis.add(
-                                embedChunksForDirective(chunks, group, target, resultSetName,
-                                        requestId, docId, nodeId)
-                                        .onFailure().recoverWithItem(error -> {
-                                            log.error("Embedder {} failed for doc {}: {}",
-                                                    target.embedderConfigId(), docId, error.getMessage());
-                                            return null;
-                                        })
-                        );
-                    }
-
-                    return Uni.combine().all().unis(embedderUnis)
-                            .with(results -> {
-                                List<SemanticProcessingResult> nonNull = new ArrayList<>();
-                                for (Object r : results) {
-                                    if (r != null) {
-                                        nonNull.add((SemanticProcessingResult) r);
-                                    }
-                                }
-                                return nonNull;
-                            });
+                    return nonNull;
                 });
-    }
-
-    private Uni<SemanticProcessingResult> embedChunksForDirective(
-            List<StreamChunksResponse> chunks,
-            DirectiveChunkingGroup group,
-            EmbedderTarget target,
-            String resultSetName,
-            String requestId,
-            String docId,
-            String nodeId) {
-
-        Multi<StreamEmbeddingsRequest> embeddingRequests = Multi.createFrom().iterable(chunks)
-                .map(chunk -> {
-                    StreamEmbeddingsRequest.Builder builder = StreamEmbeddingsRequest.newBuilder()
-                            .setRequestId(requestId)
-                            .setDocId(docId)
-                            .setChunkId(chunk.getChunkId())
-                            .setTextContent(chunk.getTextContent())
-                            .setChunkConfigId(group.chunkerConfigId())
-                            .setEmbeddingModelId(target.embedderConfigId());
-                    if (target.embedderConfig() != null) {
-                        builder.setEmbedderConfig(target.embedderConfig());
-                    }
-                    return builder.build();
-                });
-
-        return embedderStreamClient.streamEmbeddings(embeddingRequests)
-                .collect().asList()
-                .map(responses -> assembleResult(
-                        chunks, responses, group.sourceLabel(), group.chunkerConfigId(),
-                        target.embedderConfigId(), resultSetName, nodeId));
-    }
-
-    /**
-     * Extracts text from the PipeDoc using a CEL selector or simple field path.
-     * For now, supports common dot-paths; full CEL evaluation can be added later
-     * by integrating the engine's CelEvaluatorService.
-     */
-    private String extractTextByCelSelector(PipeDoc doc, String celSelector, String sourceLabel) {
-        if (celSelector == null || celSelector.isEmpty()) {
-            // Fall back to source_label as a simple field name
-            return extractSourceText(doc, sourceLabel);
-        }
-
-        // Support common dot-path patterns without full CEL
-        String normalized = celSelector.toLowerCase().trim();
-        if (normalized.startsWith("document.")) {
-            normalized = normalized.substring("document.".length());
-        }
-
-        if (normalized.startsWith("search_metadata.")) {
-            String field = normalized.substring("search_metadata.".length());
-            return extractSourceText(doc, field);
-        }
-
-        // Try as a direct field name
-        return extractSourceText(doc, celSelector);
     }
 
     // =========================================================================
@@ -277,7 +249,7 @@ public class SemanticIndexingOrchestrator {
                     log.info("Deduplicated to {} chunking groups (from {} VectorSets)",
                             chunkingGroups.size(), activeVectorSets.size());
 
-                    List<Uni<List<SemanticProcessingResult>>> groupUnis = new ArrayList<>();
+                    List<Uni<List<AssemblyOutput>>> groupUnis = new ArrayList<>();
                     for (Map.Entry<ChunkingKey, List<VectorSet>> entry : chunkingGroups.entrySet()) {
                         groupUnis.add(processVectorSetGroup(inputDoc, entry.getKey(), entry.getValue(), nodeId));
                     }
@@ -286,7 +258,12 @@ public class SemanticIndexingOrchestrator {
                 });
     }
 
-    private Uni<List<SemanticProcessingResult>> processVectorSetGroup(
+    /**
+     * Processes one VectorSet chunking group with broadcast pipelining.
+     * The chunker stream fans out to all embedder streams for VectorSets
+     * that share the same chunker config — no intermediate buffering.
+     */
+    private Uni<List<AssemblyOutput>> processVectorSetGroup(
             PipeDoc inputDoc, ChunkingKey key, List<VectorSet> vectorSets, String nodeId) {
 
         String docId = inputDoc.getDocId();
@@ -307,71 +284,60 @@ public class SemanticIndexingOrchestrator {
                 .setChunkConfigId(key.chunkerConfigId())
                 .build();
 
-        return chunkerStreamClient.streamChunks(chunksRequest)
-                .collect().asList()
-                .chain(chunks -> {
-                    if (chunks.isEmpty()) {
-                        return Uni.createFrom().item(Collections.<SemanticProcessingResult>emptyList());
+        // Open the chunker stream and side-collect for result assembly
+        List<StreamChunksResponse> collectedChunks = new CopyOnWriteArrayList<>();
+
+        Multi<StreamChunksResponse> chunkStream = chunkerStreamClient.streamChunks(chunksRequest)
+                .onItem().invoke(collectedChunks::add);
+
+        // Broadcast to all VectorSet embedders
+        Multi<StreamChunksResponse> broadcast = chunkStream
+                .broadcast().toAtLeast(vectorSets.size());
+
+        List<Uni<AssemblyOutput>> embedderUnis = new ArrayList<>();
+        for (VectorSet vs : vectorSets) {
+            Multi<StreamEmbeddingsRequest> embeddingRequests = broadcast
+                    .map(chunk -> StreamEmbeddingsRequest.newBuilder()
+                            .setRequestId(requestId)
+                            .setDocId(docId)
+                            .setChunkId(chunk.getChunkId())
+                            .setTextContent(chunk.getTextContent())
+                            .setChunkConfigId(key.chunkerConfigId())
+                            .setEmbeddingModelId(vs.getEmbeddingModelConfigId())
+                            .build());
+
+            embedderUnis.add(
+                    embedderStreamClient.streamEmbeddings(embeddingRequests)
+                            .collect().asList()
+                            .map(responses -> {
+                                AssemblyOutput output = assembleResult(
+                                        collectedChunks, responses, vs.getSourceField(),
+                                        key.chunkerConfigId(), vs.getEmbeddingModelConfigId(),
+                                        vs.getResultSetName(), nodeId);
+                                // Add VectorSet metadata to the result
+                                SemanticProcessingResult enriched = output.result().toBuilder()
+                                        .putMetadata("vector_set_id", protoValue(vs.getId()))
+                                        .putMetadata("vector_set_name", protoValue(vs.getName()))
+                                        .build();
+                                return new AssemblyOutput(enriched, output.documentAnalytics(), output.totalChunks());
+                            })
+                            .onFailure().recoverWithItem(error -> {
+                                log.error("Embedder failed for VectorSet {}: {}",
+                                        vs.getName(), error.getMessage());
+                                return null;
+                            })
+            );
+        }
+
+        return Uni.combine().all().unis(embedderUnis)
+                .with(results -> {
+                    List<AssemblyOutput> nonNull = new ArrayList<>();
+                    for (Object r : results) {
+                        if (r != null) {
+                            nonNull.add((AssemblyOutput) r);
+                        }
                     }
-
-                    List<Uni<SemanticProcessingResult>> embedderUnis = new ArrayList<>();
-                    for (VectorSet vs : vectorSets) {
-                        embedderUnis.add(
-                                embedChunksForVectorSet(chunks, vs, requestId, docId, nodeId)
-                                        .onFailure().recoverWithItem(error -> {
-                                            log.error("Embedder failed for VectorSet {}: {}",
-                                                    vs.getName(), error.getMessage());
-                                            return null;
-                                        })
-                        );
-                    }
-
-                    return Uni.combine().all().unis(embedderUnis)
-                            .with(results -> {
-                                List<SemanticProcessingResult> nonNull = new ArrayList<>();
-                                for (Object r : results) {
-                                    if (r != null) {
-                                        nonNull.add((SemanticProcessingResult) r);
-                                    }
-                                }
-                                return nonNull;
-                            });
-                });
-    }
-
-    private Uni<SemanticProcessingResult> embedChunksForVectorSet(
-            List<StreamChunksResponse> chunks, VectorSet vectorSet,
-            String requestId, String docId, String nodeId) {
-
-        String embeddingModelId = vectorSet.getEmbeddingModelConfigId();
-        String chunkConfigId = vectorSet.getChunkerConfigId();
-
-        Multi<StreamEmbeddingsRequest> embeddingRequests = Multi.createFrom().iterable(chunks)
-                .map(chunk -> StreamEmbeddingsRequest.newBuilder()
-                        .setRequestId(requestId)
-                        .setDocId(docId)
-                        .setChunkId(chunk.getChunkId())
-                        .setTextContent(chunk.getTextContent())
-                        .setChunkConfigId(chunkConfigId)
-                        .setEmbeddingModelId(embeddingModelId)
-                        .build());
-
-        return embedderStreamClient.streamEmbeddings(embeddingRequests)
-                .collect().asList()
-                .map(responses -> {
-                    SemanticProcessingResult result = assembleResult(
-                            chunks, responses, vectorSet.getSourceField(), chunkConfigId,
-                            embeddingModelId, vectorSet.getResultSetName(), nodeId);
-
-                    // Add VectorSet-specific metadata
-                    return result.toBuilder()
-                            .putMetadata("vector_set_id",
-                                    com.google.protobuf.Value.newBuilder()
-                                            .setStringValue(vectorSet.getId()).build())
-                            .putMetadata("vector_set_name",
-                                    com.google.protobuf.Value.newBuilder()
-                                            .setStringValue(vectorSet.getName()).build())
-                            .build();
+                    return nonNull;
                 });
     }
 
@@ -379,7 +345,47 @@ public class SemanticIndexingOrchestrator {
     // Shared helpers
     // =========================================================================
 
-    private SemanticProcessingResult assembleResult(
+    private String resolveResultSetName(String template, String sourceLabel,
+                                         String chunkerConfigId, String embedderConfigId) {
+        return template
+                .replace("{source_label}", sourceLabel)
+                .replace("{chunker_id}", chunkerConfigId)
+                .replace("{embedder_id}", embedderConfigId);
+    }
+
+    /**
+     * Extracts text from the PipeDoc using a CEL selector or simple field path.
+     * For now, supports common dot-paths; full CEL evaluation can be added later
+     * by integrating the engine's CelEvaluatorService.
+     */
+    private String extractTextByCelSelector(PipeDoc doc, String celSelector, String sourceLabel) {
+        if (celSelector == null || celSelector.isEmpty()) {
+            return extractSourceText(doc, sourceLabel);
+        }
+
+        String normalized = celSelector.toLowerCase().trim();
+        if (normalized.startsWith("document.")) {
+            normalized = normalized.substring("document.".length());
+        }
+
+        if (normalized.startsWith("search_metadata.")) {
+            String field = normalized.substring("search_metadata.".length());
+            return extractSourceText(doc, field);
+        }
+
+        return extractSourceText(doc, celSelector);
+    }
+
+    /**
+     * Holds the assembled result plus document-level analytics extracted from the chunk stream.
+     */
+    record AssemblyOutput(
+            SemanticProcessingResult result,
+            DocumentAnalytics documentAnalytics,
+            int totalChunks
+    ) {}
+
+    private AssemblyOutput assembleResult(
             List<StreamChunksResponse> chunks,
             List<StreamEmbeddingsResponse> embeddingResponses,
             String sourceFieldName,
@@ -405,9 +411,12 @@ public class SemanticIndexingOrchestrator {
                 .setResultSetName(resultSetName);
 
         if (nodeId != null) {
-            resultBuilder.putMetadata("coordinator_node_id",
-                    com.google.protobuf.Value.newBuilder().setStringValue(nodeId).build());
+            resultBuilder.putMetadata("coordinator_node_id", protoValue(nodeId));
         }
+
+        // Extract DocumentAnalytics from the last chunk's response
+        DocumentAnalytics documentAnalytics = null;
+        int totalChunksReported = chunks.size();
 
         for (StreamChunksResponse chunk : chunks) {
             ChunkEmbedding.Builder embeddingInfoBuilder = ChunkEmbedding.newBuilder()
@@ -422,22 +431,38 @@ public class SemanticIndexingOrchestrator {
                 embeddingInfoBuilder.addAllVector(embResp.getVectorList());
             }
 
-            resultBuilder.addChunks(SemanticChunk.newBuilder()
+            SemanticChunk.Builder chunkBuilder = SemanticChunk.newBuilder()
                     .setChunkId(chunk.getChunkId())
                     .setChunkNumber(chunk.getChunkNumber())
                     .setEmbeddingInfo(embeddingInfoBuilder.build())
-                    .putAllMetadata(chunk.getMetadataMap())
-                    .build());
+                    .putAllMetadata(chunk.getMetadataMap());
+
+            // Wire typed ChunkAnalytics if present
+            if (chunk.hasChunkAnalytics()) {
+                chunkBuilder.setChunkAnalytics(chunk.getChunkAnalytics());
+            }
+
+            resultBuilder.addChunks(chunkBuilder.build());
+
+            // Capture document analytics from the last chunk
+            if (chunk.getIsLast()) {
+                if (chunk.hasDocumentAnalytics()) {
+                    documentAnalytics = chunk.getDocumentAnalytics();
+                }
+                if (chunk.hasTotalChunks()) {
+                    totalChunksReported = chunk.getTotalChunks();
+                }
+            }
         }
 
         log.info("Assembled SemanticProcessingResult: resultSet={}, chunks={}, embeddings={}",
                 resultSetName, chunks.size(), embeddingMap.size());
 
-        return resultBuilder.build();
+        return new AssemblyOutput(resultBuilder.build(), documentAnalytics, totalChunksReported);
     }
 
     private Uni<PipeDoc> combineResults(PipeDoc inputDoc,
-                                         List<Uni<List<SemanticProcessingResult>>> groupUnis) {
+                                         List<Uni<List<AssemblyOutput>>> groupUnis) {
         String docId = inputDoc.getDocId();
 
         return Uni.combine().all().unis(groupUnis)
@@ -447,18 +472,57 @@ public class SemanticIndexingOrchestrator {
                             ? inputDoc.getSearchMetadata().toBuilder()
                             : SearchMetadata.newBuilder();
 
+                    // Collect all outputs; deduplicate SourceFieldAnalytics by (source_field, chunk_config_id)
+                    Map<String, SourceFieldAnalytics.Builder> sfaMap = new LinkedHashMap<>();
+
                     for (Object resultObj : results) {
                         @SuppressWarnings("unchecked")
-                        List<SemanticProcessingResult> semanticResults =
-                                (List<SemanticProcessingResult>) resultObj;
-                        for (SemanticProcessingResult result : semanticResults) {
-                            smBuilder.addSemanticResults(result);
+                        List<AssemblyOutput> outputs = (List<AssemblyOutput>) resultObj;
+                        for (AssemblyOutput output : outputs) {
+                            smBuilder.addSemanticResults(output.result());
+
+                            // Build SourceFieldAnalytics — one per unique (source_field, chunk_config_id)
+                            String sfaKey = output.result().getSourceFieldName()
+                                    + "::" + output.result().getChunkConfigId();
+
+                            sfaMap.computeIfAbsent(sfaKey, k -> {
+                                SourceFieldAnalytics.Builder sfaBuilder = SourceFieldAnalytics.newBuilder()
+                                        .setSourceField(output.result().getSourceFieldName())
+                                        .setChunkConfigId(output.result().getChunkConfigId())
+                                        .setTotalChunks(output.totalChunks());
+
+                                if (output.documentAnalytics() != null) {
+                                    sfaBuilder.setDocumentAnalytics(output.documentAnalytics());
+                                }
+
+                                // Compute chunk size stats
+                                int totalSize = 0;
+                                int minSize = Integer.MAX_VALUE;
+                                int maxSize = 0;
+                                for (SemanticChunk chunk : output.result().getChunksList()) {
+                                    int size = chunk.getEmbeddingInfo().getTextContent().length();
+                                    totalSize += size;
+                                    minSize = Math.min(minSize, size);
+                                    maxSize = Math.max(maxSize, size);
+                                }
+                                int count = output.result().getChunksCount();
+                                sfaBuilder.setAverageChunkSize(count > 0 ? (float) totalSize / count : 0)
+                                        .setMinChunkSize(minSize == Integer.MAX_VALUE ? 0 : minSize)
+                                        .setMaxChunkSize(maxSize);
+
+                                return sfaBuilder;
+                            });
                         }
                     }
 
+                    // Add all SourceFieldAnalytics entries
+                    for (SourceFieldAnalytics.Builder sfaBuilder : sfaMap.values()) {
+                        smBuilder.addSourceFieldAnalytics(sfaBuilder.build());
+                    }
+
                     outputDocBuilder.setSearchMetadata(smBuilder.build());
-                    log.info("Semantic orchestration complete for doc: {}. Total semantic results: {}",
-                            docId, smBuilder.getSemanticResultsCount());
+                    log.info("Semantic orchestration complete for doc: {}. Total semantic results: {}, source field analytics: {}",
+                            docId, smBuilder.getSemanticResultsCount(), sfaMap.size());
                     return outputDocBuilder.build();
                 });
     }
@@ -492,6 +556,10 @@ public class SemanticIndexingOrchestrator {
         return vectorSets.stream()
                 .collect(Collectors.groupingBy(
                         vs -> new ChunkingKey(vs.getChunkerConfigId(), vs.getSourceField())));
+    }
+
+    private static com.google.protobuf.Value protoValue(String s) {
+        return com.google.protobuf.Value.newBuilder().setStringValue(s).build();
     }
 
     // =========================================================================
