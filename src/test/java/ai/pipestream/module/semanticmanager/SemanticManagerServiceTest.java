@@ -6,6 +6,7 @@ import ai.pipestream.data.module.v1.ProcessDataRequest;
 import ai.pipestream.data.module.v1.ProcessDataResponse;
 import ai.pipestream.data.module.v1.ServiceMetadata;
 import ai.pipestream.data.v1.*;
+import ai.pipestream.data.v1.LogEntry;
 import ai.pipestream.module.semanticmanager.service.VectorSetResolver;
 import ai.pipestream.opensearch.v1.VectorSet;
 import com.google.protobuf.Struct;
@@ -87,7 +88,8 @@ class SemanticManagerServiceTest {
                 .getItem();
 
         assertTrue(response.getSuccess());
-        assertTrue(response.getProcessorLogsList().stream()
+        assertTrue(response.getLogEntriesList().stream()
+                .map(LogEntry::getMessage)
                 .anyMatch(l -> l.contains("no document")));
     }
 
@@ -123,7 +125,7 @@ class SemanticManagerServiceTest {
         ProcessDataResponse response = pipeStepProcessorService.processData(request)
                 .await().atMost(Duration.ofSeconds(30));
 
-        assertTrue(response.getSuccess(), "Processing should succeed. Logs: " + response.getProcessorLogsList());
+        assertTrue(response.getSuccess(), "Processing should succeed. Logs: " + response.getLogEntriesList().stream().map(LogEntry::getMessage).toList());
         assertTrue(response.hasOutputDoc(), "Should return enriched document");
         assertEquals(testDoc.getDocId(), response.getOutputDoc().getDocId());
 
@@ -243,7 +245,7 @@ class SemanticManagerServiceTest {
         ProcessDataResponse response = pipeStepProcessorService.processData(request)
                 .await().atMost(Duration.ofSeconds(30));
 
-        assertTrue(response.getSuccess(), "Logs: " + response.getProcessorLogsList());
+        assertTrue(response.getSuccess(), "Logs: " + response.getLogEntriesList().stream().map(LogEntry::getMessage).toList());
         PipeDoc outputDoc = response.getOutputDoc();
 
         assertEquals(4, outputDoc.getSearchMetadata().getSemanticResultsCount(),

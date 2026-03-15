@@ -57,7 +57,7 @@ class SemanticIndexingOrchestratorTest {
         when(vectorSetResolver.resolveVectorSets(anyString()))
                 .thenReturn(Uni.createFrom().item(List.of()));
 
-        SemanticManagerOptions options = new SemanticManagerOptions("test-index", null, 4, 8);
+        SemanticManagerOptions options = new SemanticManagerOptions("test-index", null, 4, 8, null);
 
         PipeDoc result = orchestrator.orchestrate(inputDoc, options, "node-1")
                 .await().indefinitely();
@@ -88,7 +88,7 @@ class SemanticIndexingOrchestratorTest {
 
         setupMockChunkerAndEmbedder();
 
-        SemanticManagerOptions options = new SemanticManagerOptions("test-index", null, 4, 8);
+        SemanticManagerOptions options = new SemanticManagerOptions("test-index", null, 4, 8, null);
 
         PipeDoc result = orchestrator.orchestrate(inputDoc, options, "node-1")
                 .await().indefinitely();
@@ -123,7 +123,7 @@ class SemanticIndexingOrchestratorTest {
 
         setupMockChunkerAndEmbedder();
 
-        SemanticManagerOptions options = new SemanticManagerOptions("test-index", null, 4, 8);
+        SemanticManagerOptions options = new SemanticManagerOptions("test-index", null, 4, 8, null);
 
         PipeDoc result = orchestrator.orchestrate(inputDoc, options, "node-1")
                 .await().indefinitely();
@@ -238,7 +238,7 @@ class SemanticIndexingOrchestratorTest {
 
         setupMockChunkerAndEmbedder();
 
-        orchestrator.orchestrate(inputDoc, new SemanticManagerOptions("some-index", null, 4, 8), "node-1")
+        orchestrator.orchestrate(inputDoc, new SemanticManagerOptions("some-index", null, 4, 8, null), "node-1")
                 .await().indefinitely();
 
         // VectorSetResolver should never be called
