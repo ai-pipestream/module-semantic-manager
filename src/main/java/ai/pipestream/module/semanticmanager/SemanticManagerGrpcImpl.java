@@ -8,6 +8,7 @@ import ai.pipestream.module.semanticmanager.service.SemanticIndexingOrchestrator
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
+import java.util.List;
 import com.google.protobuf.util.JsonFormat;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
@@ -71,23 +72,54 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
 
         // Parse configuration
         SemanticManagerOptions options = parseOptions(request.getConfig());
+        List<String> auditLogs = new java.util.ArrayList<>();
+
+        String configSummary = String.format(
+                "Config: indexName=%s, hasDirectives=%s, directivesCount=%d",
+                options.effectiveIndexName(),
+                options.hasDirectives(),
+                options.directives() != null ? options.directives().size() : 0);
+        log.info(configSummary);
+        auditLogs.add(configSummary);
+
+        if (options.hasDirectives()) {
+            for (int i = 0; i < options.directives().size(); i++) {
+                var d = options.directives().get(i);
+                String directiveInfo = String.format(
+                        "Directive %d: source='%s', selector='%s', chunkers=%d, embedders=%d",
+                        i, d.sourceLabel(), d.celSelector(),
+                        d.chunkerConfigs() != null ? d.chunkerConfigs().size() : 0,
+                        d.embedderConfigs() != null ? d.embedderConfigs().size() : 0);
+                log.info(directiveInfo);
+                auditLogs.add(directiveInfo);
+            }
+        }
 
         // Run orchestration
+        long startTime = System.currentTimeMillis();
         return orchestrator.orchestrate(inputDoc, options, nodeId)
                 .map(enrichedDoc -> {
+                    long duration = System.currentTimeMillis() - startTime;
                     int semanticResultCount = enrichedDoc.hasSearchMetadata()
                             ? enrichedDoc.getSearchMetadata().getSemanticResultsCount()
                             : 0;
 
-                    String logMsg = String.format(
-                            "Semantic manager produced %d SemanticProcessingResults for doc: %s",
-                            semanticResultCount, inputDoc.getDocId());
-                    log.info(logMsg);
+                    String resultMsg = String.format(
+                            "Semantic manager produced %d SemanticProcessingResults for doc: %s in %dms",
+                            semanticResultCount, inputDoc.getDocId(), duration);
+                    log.info(resultMsg);
+                    auditLogs.add(resultMsg);
+
+                    if (semanticResultCount == 0 && options.hasDirectives()) {
+                        auditLogs.add("Warning: directives were provided but no results produced. " +
+                                "Check that chunker and embedder services are running and registered " +
+                                "with the correct Consul service names.");
+                    }
 
                     return ProcessDataResponse.newBuilder()
                             .setSuccess(true)
                             .setOutputDoc(enrichedDoc)
-                            .addProcessorLogs(logMsg)
+                            .addAllProcessorLogs(auditLogs)
                             .build();
                 });
     }
@@ -95,11 +127,19 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
     private SemanticManagerOptions parseOptions(ProcessConfiguration config) {
         try {
             if (config != null && config.hasJsonConfig() && config.getJsonConfig().getFieldsCount() > 0) {
-                String jsonStr = JsonFormat.printer().print(config.getJsonConfig());
-                return objectMapper.readValue(jsonStr, SemanticManagerOptions.class);
+                Struct jsonConfig = config.getJsonConfig();
+                log.info("Config Struct keys: {}", jsonConfig.getFieldsMap().keySet());
+                String jsonStr = JsonFormat.printer().print(jsonConfig);
+                log.debug("Config JSON for parsing: {}", jsonStr);
+                SemanticManagerOptions parsed = objectMapper.readValue(jsonStr, SemanticManagerOptions.class);
+                log.info("Parsed SemanticManagerOptions: indexName={}, hasDirectives={}, directivesCount={}",
+                        parsed.effectiveIndexName(),
+                        parsed.hasDirectives(),
+                        parsed.directives() != null ? parsed.directives().size() : 0);
+                return parsed;
             }
         } catch (Exception e) {
-            log.warn("Failed to parse SemanticManagerOptions, using defaults: {}", e.getMessage());
+            log.warn("Failed to parse SemanticManagerOptions, using defaults: {}", e.getMessage(), e);
         }
         return new SemanticManagerOptions();
     }

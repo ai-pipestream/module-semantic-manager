@@ -18,7 +18,7 @@ import org.slf4j.LoggerFactory;
 public class ChunkerStreamClient {
 
     private static final Logger log = LoggerFactory.getLogger(ChunkerStreamClient.class);
-    private static final String SERVICE_NAME = "chunker-service";
+    private static final String SERVICE_NAME = "chunker";
 
     @Inject
     GrpcClientFactory grpcClientFactory;

@@ -18,7 +18,7 @@ import org.slf4j.LoggerFactory;
 public class EmbedderStreamClient {
 
     private static final Logger log = LoggerFactory.getLogger(EmbedderStreamClient.class);
-    private static final String SERVICE_NAME = "embedder-service";
+    private static final String SERVICE_NAME = "embedder";
 
     @Inject
     GrpcClientFactory grpcClientFactory;
