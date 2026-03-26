@@ -65,7 +65,7 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
         if (!request.hasDocument()) {
             return Uni.createFrom().item(
                     ProcessDataResponse.newBuilder()
-                            .setSuccess(true)
+                            .setOutcome(ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS)
                             .addLogEntries(moduleLog("Semantic manager: no document to process.", LogLevel.LOG_LEVEL_INFO))
                             .build());
         }
@@ -131,11 +131,24 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
                                 "with the correct Consul service names.", LogLevel.LOG_LEVEL_WARN));
                     }
 
-                    return ProcessDataResponse.newBuilder()
-                            .setSuccess(true)
+                    // Determine expected vs actual result count for partial detection
+                    int expectedCount = countExpectedResults(options);
+                    var outcomeEnum = ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS;
+                    ProcessDataResponse.Builder respBuilder = ProcessDataResponse.newBuilder()
                             .setOutputDoc(enrichedDoc)
-                            .addAllLogEntries(auditLogs)
-                            .build();
+                            .addAllLogEntries(auditLogs);
+
+                    if (semanticResultCount < expectedCount && semanticResultCount > 0) {
+                        outcomeEnum = ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL;
+                        String partialMsg = String.format("Partial: %d of %d expected embedding strategies produced results",
+                                semanticResultCount, expectedCount);
+                        respBuilder.addPartialFailureDetails(partialMsg);
+                        auditLogs.add(moduleLog(partialMsg, LogLevel.LOG_LEVEL_WARN));
+                    } else if (semanticResultCount == 0 && expectedCount > 0) {
+                        outcomeEnum = ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_FAILURE;
+                    }
+
+                    return respBuilder.setOutcome(outcomeEnum).build();
                 });
     }
 
@@ -181,6 +194,20 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
         return Uni.createFrom().item(responseBuilder.build());
     }
 
+    private static int countExpectedResults(SemanticManagerOptions options) {
+        if (options.hasDirectives()) {
+            int count = 0;
+            for (var directive : options.directives()) {
+                int chunkers = directive.chunkerConfigs() != null ? directive.chunkerConfigs().size() : 1;
+                int embedders = directive.embedderConfigs() != null ? directive.embedderConfigs().size() : 1;
+                count += chunkers * embedders;
+            }
+            return count;
+        }
+        // Convenience fields = 1 result
+        return options.hasConvenienceFields() ? 1 : 0;
+    }
+
     private static LogEntry moduleLog(String message, LogLevel level) {
         return LogEntry.newBuilder()
             .setSource(LogEntrySource.LOG_ENTRY_SOURCE_MODULE)
@@ -193,7 +220,7 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
 
     private ProcessDataResponse createErrorResponse(String errorMessage, Throwable e) {
         ProcessDataResponse.Builder responseBuilder = ProcessDataResponse.newBuilder();
-        responseBuilder.setSuccess(false);
+        responseBuilder.setOutcome(ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_FAILURE);
         responseBuilder.addLogEntries(moduleLog(errorMessage, LogLevel.LOG_LEVEL_ERROR));
 
         Struct.Builder errorDetailsBuilder = Struct.newBuilder();

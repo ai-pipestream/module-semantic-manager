@@ -87,7 +87,7 @@ class SemanticManagerServiceTest {
                 .awaitItem()
                 .getItem();
 
-        assertTrue(response.getSuccess());
+        assertTrue(response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS || response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL);
         assertTrue(response.getLogEntriesList().stream()
                 .map(LogEntry::getMessage)
                 .anyMatch(l -> l.contains("no document")));
@@ -125,7 +125,7 @@ class SemanticManagerServiceTest {
         ProcessDataResponse response = pipeStepProcessorService.processData(request)
                 .await().atMost(Duration.ofSeconds(30));
 
-        assertTrue(response.getSuccess(), "Processing should succeed. Logs: " + response.getLogEntriesList().stream().map(LogEntry::getMessage).toList());
+        assertTrue(response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS || response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL, "Processing should succeed. Logs: " + response.getLogEntriesList().stream().map(LogEntry::getMessage).toList());
         assertTrue(response.hasOutputDoc(), "Should return enriched document");
         assertEquals(testDoc.getDocId(), response.getOutputDoc().getDocId());
 
@@ -189,7 +189,7 @@ class SemanticManagerServiceTest {
         ProcessDataResponse response = pipeStepProcessorService.processData(request)
                 .await().atMost(Duration.ofSeconds(30));
 
-        assertTrue(response.getSuccess());
+        assertTrue(response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS || response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL);
         PipeDoc outputDoc = response.getOutputDoc();
         assertEquals(2, outputDoc.getSearchMetadata().getSemanticResultsCount(),
                 "Should have 2 results (one per embedder model)");
@@ -245,7 +245,7 @@ class SemanticManagerServiceTest {
         ProcessDataResponse response = pipeStepProcessorService.processData(request)
                 .await().atMost(Duration.ofSeconds(30));
 
-        assertTrue(response.getSuccess(), "Logs: " + response.getLogEntriesList().stream().map(LogEntry::getMessage).toList());
+        assertTrue(response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS || response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL, "Logs: " + response.getLogEntriesList().stream().map(LogEntry::getMessage).toList());
         PipeDoc outputDoc = response.getOutputDoc();
 
         assertEquals(4, outputDoc.getSearchMetadata().getSemanticResultsCount(),
@@ -309,7 +309,7 @@ class SemanticManagerServiceTest {
         ProcessDataResponse response = pipeStepProcessorService.processData(request)
                 .await().atMost(Duration.ofSeconds(30));
 
-        assertTrue(response.getSuccess());
+        assertTrue(response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS || response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL);
         PipeDoc outputDoc = response.getOutputDoc();
         assertEquals(2, outputDoc.getSearchMetadata().getSemanticResultsCount(),
                 "Should have 2 results (one per source field)");
@@ -356,7 +356,7 @@ class SemanticManagerServiceTest {
                 .await().atMost(Duration.ofSeconds(60));
         long elapsedMs = System.currentTimeMillis() - startMs;
 
-        assertTrue(response.getSuccess());
+        assertTrue(response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_SUCCESS || response.getOutcome() == ai.pipestream.data.module.v1.ProcessingOutcome.PROCESSING_OUTCOME_PARTIAL);
         PipeDoc outputDoc = response.getOutputDoc();
         SemanticProcessingResult result = outputDoc.getSearchMetadata().getSemanticResults(0);
 
