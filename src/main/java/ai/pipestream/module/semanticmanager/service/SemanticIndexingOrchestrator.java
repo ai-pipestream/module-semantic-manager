@@ -282,18 +282,23 @@ public class SemanticIndexingOrchestrator {
 
         return embedderStreamClient.listEmbeddingModels(true)
                 .map(response -> {
-                    Set<String> readyModels = response.getModelsList().stream()
-                            .map(EmbeddingModelInfo::getModelName)
-                            .collect(Collectors.toSet());
+                    // Build lookup set from ALL model identifiers — enum name, serving name, and HuggingFace ID.
+                    // Directives may use any of these naming conventions.
+                    Set<String> readyIdentifiers = new java.util.HashSet<>();
+                    for (EmbeddingModelInfo info : response.getModelsList()) {
+                        readyIdentifiers.add(info.getEnumName());
+                        readyIdentifiers.add(info.getModelName());
+                        readyIdentifiers.add(info.getHuggingFaceId());
+                    }
 
                     List<String> missing = requiredModelIds.stream()
-                            .filter(id -> !readyModels.contains(id))
+                            .filter(id -> !readyIdentifiers.contains(id))
                             .toList();
 
                     if (!missing.isEmpty()) {
                         log.error("Phase 0 FAILED: embedding models not ready for doc {}: {}. " +
-                                "Available models: {}. Document will be returned unchanged for DLQ.",
-                                docId, missing, readyModels);
+                                "Available identifiers: {}. Document will be returned unchanged for DLQ.",
+                                docId, missing, readyIdentifiers);
                         return false;
                     }
 
