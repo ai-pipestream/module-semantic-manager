@@ -1305,6 +1305,31 @@ public class SemanticIndexingOrchestrator {
                     sourceLabel, embeddingConfigId, nodeId));
         }
 
+        // Section centroids — resolve DocOutline from Tika or Docling
+        DocOutline outline = resolveDocOutline(inputDoc);
+        if (outline != null && outline.getSectionsCount() > 0) {
+            List<CentroidComputer.SectionInfo> sectionInfos = outline.getSectionsList().stream()
+                    .filter(Section::hasCharStartOffset)
+                    .map(s -> new CentroidComputer.SectionInfo(
+                            s.hasTitle() ? s.getTitle() : null,
+                            s.getDepth(),
+                            s.getCharStartOffset(),
+                            s.hasCharEndOffset() ? s.getCharEndOffset() : -1))
+                    .toList();
+
+            if (!sectionInfos.isEmpty()) {
+                List<CentroidComputer.CentroidResult> sectionCentroids =
+                        CentroidComputer.computeSectionCentroids(
+                                sentenceVectors, sentenceTexts, sentenceOffsets, sectionInfos);
+
+                if (!sectionCentroids.isEmpty()) {
+                    results.add(buildCentroidAssemblyOutput(
+                            sectionCentroids, "section_centroid",
+                            sourceLabel, embeddingConfigId, nodeId));
+                }
+            }
+        }
+
         // Document centroid
         if (!sentenceVectors.isEmpty()) {
             CentroidComputer.CentroidResult docCentroid =
@@ -1315,6 +1340,27 @@ public class SemanticIndexingOrchestrator {
         }
 
         return results;
+    }
+
+    /**
+     * Resolves DocOutline from the document, trying Tika metadata first, then Docling.
+     * Returns null if no outline is available from any source.
+     */
+    private DocOutline resolveDocOutline(PipeDoc doc) {
+        if (!doc.hasSearchMetadata()) return null;
+
+        // Primary: DocOutline directly on SearchMetadata (populated by Tika parser)
+        if (doc.getSearchMetadata().hasDocOutline()
+                && doc.getSearchMetadata().getDocOutline().getSectionsCount() > 0) {
+            return doc.getSearchMetadata().getDocOutline();
+        }
+
+        // Fallback: Docling response may have section structure in parsed_metadata
+        // Docling sections would need to be mapped to DocOutline by the parser
+        // For now, the parser is responsible for populating doc_outline from whichever
+        // source is available — we just consume it here.
+
+        return null;
     }
 
     private AssemblyOutput buildCentroidAssemblyOutput(

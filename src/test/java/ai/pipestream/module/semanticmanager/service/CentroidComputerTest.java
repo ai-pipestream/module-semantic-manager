@@ -150,6 +150,72 @@ class CentroidComputerTest {
         assertL2Normalized(result.vector());
     }
 
+    @Test
+    void computeSectionCentroids_groupsSentencesBySection() {
+        // 5 sentences, 2 sections: "Introduction" [0..50), "Methods" [50..100)
+        List<float[]> vecs = List.of(
+                new float[]{1.0f, 0.0f},   // sent 0 at offset 5
+                new float[]{0.9f, 0.1f},   // sent 1 at offset 20
+                new float[]{0.0f, 1.0f},   // sent 2 at offset 55
+                new float[]{0.1f, 0.9f},   // sent 3 at offset 70
+                new float[]{0.05f, 0.95f}  // sent 4 at offset 85
+        );
+        List<String> texts = List.of("s0", "s1", "s2", "s3", "s4");
+        int[][] offsets = {{5, 15}, {20, 35}, {55, 65}, {70, 80}, {85, 95}};
+
+        List<CentroidComputer.SectionInfo> sections = List.of(
+                new CentroidComputer.SectionInfo("Introduction", 0, 0, 50),
+                new CentroidComputer.SectionInfo("Methods", 0, 50, 100)
+        );
+
+        List<CentroidComputer.CentroidResult> centroids =
+                CentroidComputer.computeSectionCentroids(vecs, texts, offsets, sections);
+
+        assertThat(centroids).as("2 sections with sentences → 2 centroids").hasSize(2);
+
+        assertThat(centroids.get(0).sectionTitle()).as("First section title")
+                .isEqualTo("Introduction");
+        assertThat(centroids.get(0).sourceVectorCount()).as("Intro has 2 sentences")
+                .isEqualTo(2);
+        assertL2Normalized(centroids.get(0).vector());
+
+        assertThat(centroids.get(1).sectionTitle()).as("Second section title")
+                .isEqualTo("Methods");
+        assertThat(centroids.get(1).sourceVectorCount()).as("Methods has 3 sentences")
+                .isEqualTo(3);
+        assertL2Normalized(centroids.get(1).vector());
+    }
+
+    @Test
+    void computeSectionCentroids_emptySections_returnsEmpty() {
+        List<CentroidComputer.CentroidResult> centroids =
+                CentroidComputer.computeSectionCentroids(
+                        List.of(new float[]{1.0f, 0.0f}),
+                        List.of("text"),
+                        new int[][]{{0, 10}},
+                        List.of());
+
+        assertThat(centroids).as("No sections → no centroids").isEmpty();
+    }
+
+    @Test
+    void computeSectionCentroids_sectionWithNoSentences_skipped() {
+        List<float[]> vecs = List.of(new float[]{1.0f, 0.0f});
+        List<String> texts = List.of("s0");
+        int[][] offsets = {{5, 15}};
+
+        List<CentroidComputer.SectionInfo> sections = List.of(
+                new CentroidComputer.SectionInfo("Empty Section", 0, 100, 200),
+                new CentroidComputer.SectionInfo("Has Content", 0, 0, 50)
+        );
+
+        List<CentroidComputer.CentroidResult> centroids =
+                CentroidComputer.computeSectionCentroids(vecs, texts, offsets, sections);
+
+        assertThat(centroids).as("Only sections with sentences produce centroids").hasSize(1);
+        assertThat(centroids.get(0).sectionTitle()).isEqualTo("Has Content");
+    }
+
     private void assertL2Normalized(float[] v) {
         float norm = 0f;
         for (float f : v) norm += f * f;

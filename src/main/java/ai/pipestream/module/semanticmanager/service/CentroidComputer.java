@@ -138,6 +138,84 @@ public final class CentroidComputer {
     }
 
     /**
+     * Computes section centroids by grouping sentences into sections based on
+     * Section char_start_offset/char_end_offset from DocOutline.
+     * Each section's centroid is the average of its constituent sentence vectors.
+     *
+     * @param sentenceVectors  embedding vectors for each sentence
+     * @param sentenceTexts    text of each sentence
+     * @param sentenceOffsets  [i] = {startOffset, endOffset} for sentence i
+     * @param sections         sections from DocOutline, must have char_start_offset populated
+     * @return one CentroidResult per section that contains at least one sentence
+     */
+    public static List<CentroidResult> computeSectionCentroids(
+            List<float[]> sentenceVectors,
+            List<String> sentenceTexts,
+            int[][] sentenceOffsets,
+            List<SectionInfo> sections) {
+
+        if (sections.isEmpty() || sentenceVectors.isEmpty()) {
+            return List.of();
+        }
+
+        // Sort sections by char_start_offset
+        List<SectionInfo> sorted = sections.stream()
+                .filter(s -> s.charStartOffset >= 0)
+                .sorted(java.util.Comparator.comparingInt(s -> s.charStartOffset))
+                .toList();
+
+        if (sorted.isEmpty()) {
+            return List.of();
+        }
+
+        List<CentroidResult> centroids = new ArrayList<>();
+
+        for (int s = 0; s < sorted.size(); s++) {
+            SectionInfo section = sorted.get(s);
+            int sectionStart = section.charStartOffset;
+            int sectionEnd = (s + 1 < sorted.size())
+                    ? sorted.get(s + 1).charStartOffset
+                    : (section.charEndOffset > sectionStart ? section.charEndOffset : Integer.MAX_VALUE);
+
+            // Find sentences whose start offset falls within this section
+            List<float[]> vecs = new ArrayList<>();
+            StringBuilder text = new StringBuilder();
+            for (int i = 0; i < sentenceOffsets.length; i++) {
+                int sentStart = sentenceOffsets[i][0];
+                if (sentStart >= sectionStart && sentStart < sectionEnd) {
+                    if (i < sentenceVectors.size()) vecs.add(sentenceVectors.get(i));
+                    if (i < sentenceTexts.size()) {
+                        if (!text.isEmpty()) text.append(" ");
+                        text.append(sentenceTexts.get(i));
+                    }
+                }
+            }
+
+            if (!vecs.isEmpty()) {
+                centroids.add(new CentroidResult(
+                        averageAndNormalize(vecs),
+                        text.toString(),
+                        vecs.size(),
+                        section.title,
+                        section.depth));
+            }
+        }
+
+        return centroids;
+    }
+
+    /**
+     * Lightweight section info extracted from DocOutline Section proto.
+     * Avoids proto dependency in the pure computation class.
+     */
+    public record SectionInfo(
+            String title,
+            int depth,
+            int charStartOffset,
+            int charEndOffset
+    ) {}
+
+    /**
      * Computes a single document centroid by averaging all sentence vectors.
      */
     public static CentroidResult computeDocumentCentroid(
