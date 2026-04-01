@@ -181,9 +181,32 @@ public class SemanticIndexingOrchestrator {
                         return Uni.createFrom().item(inputDoc);
                     }
 
-                    // ─── Phase 1: Chunk (one call per source text) ───
-                    List<Uni<SourceTextChunkResult>> chunkUnis = new ArrayList<>();
+                    // ─── Separate semantic vs standard chunk configs ───
+                    // Semantic chunking has its own pipeline (sentence split → embed → boundary → re-embed)
+                    List<Uni<List<AssemblyOutput>>> semanticUnis = new ArrayList<>();
+                    Map<String, SourceTextWork> standardWorkMap = new LinkedHashMap<>();
+
                     for (SourceTextWork work : sourceTextWorkMap.values()) {
+                        Map<String, ChunkConfigWork> standardConfigs = new LinkedHashMap<>();
+                        for (Map.Entry<String, ChunkConfigWork> entry : work.chunkConfigs().entrySet()) {
+                            if (isSemanticChunking(entry.getKey(), entry.getValue())) {
+                                log.info("Routing chunk config '{}' to semantic chunking path for source '{}'",
+                                        entry.getKey(), work.sourceLabel());
+                                semanticUnis.add(processSemanticChunkingGroup(
+                                        inputDoc, work, entry.getKey(), entry.getValue(), nodeId));
+                            } else {
+                                standardConfigs.put(entry.getKey(), entry.getValue());
+                            }
+                        }
+                        if (!standardConfigs.isEmpty()) {
+                            standardWorkMap.put(work.sourceLabel(),
+                                    new SourceTextWork(work.sourceText(), work.sourceLabel(), standardConfigs));
+                        }
+                    }
+
+                    // ─── Phase 1: Chunk (standard path — one call per source text) ───
+                    List<Uni<SourceTextChunkResult>> chunkUnis = new ArrayList<>();
+                    for (SourceTextWork work : standardWorkMap.values()) {
                         chunkUnis.add(chunkSourceText(work, docId));
                     }
 
@@ -195,10 +218,30 @@ public class SemanticIndexingOrchestrator {
                         fieldLevelUni = Uni.createFrom().item(Collections.emptyList());
                     }
 
+                    // Combine semantic results into a single Uni
+                    Uni<List<AssemblyOutput>> semanticUni;
+                    if (!semanticUnis.isEmpty()) {
+                        semanticUni = Uni.combine().all().unis(semanticUnis)
+                                .with(rawResults -> {
+                                    List<AssemblyOutput> all = new ArrayList<>();
+                                    for (Object r : rawResults) {
+                                        @SuppressWarnings("unchecked")
+                                        List<AssemblyOutput> list = (List<AssemblyOutput>) r;
+                                        all.addAll(list);
+                                    }
+                                    return all;
+                                });
+                    } else {
+                        semanticUni = Uni.createFrom().item(Collections.emptyList());
+                    }
+
                     if (chunkUnis.isEmpty()) {
-                        // Only field-level work
-                        return fieldLevelUni.map(fieldResults ->
-                                assembleDocument(inputDoc, Collections.emptyList(), fieldResults, nodeId));
+                        // No standard chunking — combine semantic + field-level results
+                        return Uni.combine().all().unis(semanticUni, fieldLevelUni)
+                                .with((semanticResults, fieldResults) -> {
+                                    List<AssemblyOutput> combined = new ArrayList<>(semanticResults);
+                                    return assembleDocument(inputDoc, combined, fieldResults, nodeId);
+                                });
                     }
 
                     // Combine all chunk results
@@ -211,12 +254,12 @@ public class SemanticIndexingOrchestrator {
                                 return chunkResults;
                             })
                             .chain(chunkResults -> {
-                                // ─── Phase 2: Embed (parallel fan-out) ───
+                                // ─── Phase 2: Embed (parallel fan-out for standard path) ───
                                 List<Uni<AssemblyOutput>> embedUnis = new ArrayList<>();
 
                                 for (int i = 0; i < chunkResults.size(); i++) {
                                     SourceTextChunkResult cr = chunkResults.get(i);
-                                    SourceTextWork work = new ArrayList<>(sourceTextWorkMap.values()).get(i);
+                                    SourceTextWork work = new ArrayList<>(standardWorkMap.values()).get(i);
 
                                     for (ChunkConfigWork ccWork : work.chunkConfigs().values()) {
                                         String chunkConfigId = ccWork.chunkConfigId();
@@ -243,11 +286,14 @@ public class SemanticIndexingOrchestrator {
                                 }
 
                                 if (embedUnis.isEmpty()) {
-                                    return fieldLevelUni.map(fieldResults ->
-                                            assembleDocument(inputDoc, Collections.emptyList(), fieldResults, nodeId));
+                                    return Uni.combine().all().unis(semanticUni, fieldLevelUni)
+                                            .with((semanticResults, fieldResults) -> {
+                                                List<AssemblyOutput> combined = new ArrayList<>(semanticResults);
+                                                return assembleDocument(inputDoc, combined, fieldResults, nodeId);
+                                            });
                                 }
 
-                                // Combine embed results with field-level results
+                                // Combine embed results with semantic + field-level results
                                 Uni<List<AssemblyOutput>> allEmbedUni = Uni.combine().all().unis(embedUnis)
                                         .with(rawEmbedResults -> {
                                             List<AssemblyOutput> results = new ArrayList<>();
@@ -257,9 +303,12 @@ public class SemanticIndexingOrchestrator {
                                             return results;
                                         });
 
-                                return Uni.combine().all().unis(allEmbedUni, fieldLevelUni)
-                                        .with((embedResults, fieldResults) ->
-                                                assembleDocument(inputDoc, embedResults, fieldResults, nodeId));
+                                return Uni.combine().all().unis(allEmbedUni, semanticUni, fieldLevelUni)
+                                        .with((embedResults, semanticResults, fieldResults) -> {
+                                            List<AssemblyOutput> combined = new ArrayList<>(embedResults);
+                                            combined.addAll(semanticResults);
+                                            return assembleDocument(inputDoc, combined, fieldResults, nodeId);
+                                        });
                             });
                 });
     }
@@ -954,6 +1003,366 @@ public class SemanticIndexingOrchestrator {
         return vectorSets.stream()
                 .filter(vs -> idSet.contains(vs.getId()))
                 .collect(Collectors.toList());
+    }
+
+    // =========================================================================
+    // Semantic chunking — topic-boundary detection via sentence embedding similarity
+    // =========================================================================
+
+    private static final String SEMANTIC_CHUNK_CONFIG_ID = "semantic";
+
+    private boolean isSemanticChunking(String chunkConfigId, ChunkConfigWork work) {
+        if (SEMANTIC_CHUNK_CONFIG_ID.equals(chunkConfigId)) return true;
+        if (work != null && work.chunkerConfig() != null) {
+            com.google.protobuf.Value algoVal = work.chunkerConfig()
+                    .getFieldsOrDefault("algorithm", null);
+            if (algoVal != null && "SEMANTIC".equalsIgnoreCase(algoVal.getStringValue())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    record SemanticChunkingParams(
+            float similarityThreshold,
+            int percentileThreshold,
+            int minChunkSentences,
+            int maxChunkSentences,
+            String sentenceEmbeddingModel,
+            boolean storeSentenceVectors,
+            boolean computeCentroids
+    ) {
+        static SemanticChunkingParams defaults(String defaultModel) {
+            return new SemanticChunkingParams(0.5f, 20, 2, 30, defaultModel, true, true);
+        }
+    }
+
+    private SemanticChunkingParams parseSemanticConfig(Struct config, String defaultModel) {
+        if (config == null) return SemanticChunkingParams.defaults(defaultModel);
+        com.google.protobuf.Value scVal = config.getFieldsOrDefault("semantic_config", null);
+        if (scVal == null || !scVal.hasStructValue()) {
+            return SemanticChunkingParams.defaults(defaultModel);
+        }
+        Struct sc = scVal.getStructValue();
+        return new SemanticChunkingParams(
+                getFloat(sc, "similarity_threshold", 0.5f),
+                getInt(sc, "percentile_threshold", 20),
+                getInt(sc, "min_chunk_sentences", 2),
+                getInt(sc, "max_chunk_sentences", 30),
+                getString(sc, "sentence_embedding_model", defaultModel),
+                getBool(sc, "store_sentence_vectors", true),
+                getBool(sc, "compute_centroids", true)
+        );
+    }
+
+    private static float getFloat(Struct s, String key, float def) {
+        com.google.protobuf.Value v = s.getFieldsOrDefault(key, null);
+        return v != null && v.hasNumberValue() ? (float) v.getNumberValue() : def;
+    }
+    private static int getInt(Struct s, String key, int def) {
+        com.google.protobuf.Value v = s.getFieldsOrDefault(key, null);
+        return v != null && v.hasNumberValue() ? (int) v.getNumberValue() : def;
+    }
+    private static String getString(Struct s, String key, String def) {
+        com.google.protobuf.Value v = s.getFieldsOrDefault(key, null);
+        return v != null && v.hasStringValue() ? v.getStringValue() : def;
+    }
+    private static boolean getBool(Struct s, String key, boolean def) {
+        com.google.protobuf.Value v = s.getFieldsOrDefault(key, null);
+        return v != null && v.hasBoolValue() ? v.getBoolValue() : def;
+    }
+
+    /**
+     * Processes a semantic chunking directive: sentence split → sentence embed →
+     * boundary detection → chunk embed → centroid computation.
+     * Returns up to 5 AssemblyOutputs (sentence, semantic, paragraph, section, document).
+     */
+    private Uni<List<AssemblyOutput>> processSemanticChunkingGroup(
+            PipeDoc inputDoc,
+            SourceTextWork work,
+            String chunkConfigId,
+            ChunkConfigWork chunkWork,
+            String nodeId) {
+
+        String docId = inputDoc.getDocId();
+        String sourceText = work.sourceText();
+        String sourceLabel = work.sourceLabel();
+
+        // Determine default embedder model from first embedder target
+        String defaultModel = chunkWork.embedderTargets().isEmpty()
+                ? "all-MiniLM-L6-v2" : chunkWork.embedderTargets().get(0).embedderConfigId();
+        SemanticChunkingParams params = parseSemanticConfig(chunkWork.chunkerConfig(), defaultModel);
+
+        log.info("Semantic chunking for doc {} source '{}': threshold={}, percentile={}, model={}",
+                docId, sourceLabel, params.similarityThreshold(), params.percentileThreshold(),
+                params.sentenceEmbeddingModel());
+
+        // Phase 1a: Sentence split — call chunker with SENTENCE algorithm
+        StreamChunksRequest sentenceReq = StreamChunksRequest.newBuilder()
+                .setRequestId(UUID.randomUUID().toString())
+                .setDocId(docId)
+                .setSourceFieldName(sourceLabel)
+                .setTextContent(sourceText)
+                .addChunkConfigs(ChunkConfigEntry.newBuilder()
+                        .setChunkConfigId("__sentence_split__")
+                        .setConfig(ChunkerConfig.newBuilder()
+                                .setAlgorithm(ChunkAlgorithm.CHUNK_ALGORITHM_SENTENCE)
+                                .setChunkSize(1)
+                                .setChunkOverlap(0)
+                                .build())
+                        .build())
+                .build();
+
+        return chunkerStreamClient.streamChunks(sentenceReq)
+                .collect().asList()
+                .chain(sentenceResponses -> {
+                    List<StreamChunksResponse> sentences = sentenceResponses.stream()
+                            .filter(r -> "__sentence_split__".equals(r.getChunkConfigId()))
+                            .toList();
+
+                    if (sentences.isEmpty()) {
+                        log.warn("Semantic chunking: no sentences from chunker for doc {}", docId);
+                        return Uni.createFrom().item(List.<AssemblyOutput>of());
+                    }
+
+                    log.info("Semantic chunking: {} sentences for doc {} source '{}'",
+                            sentences.size(), docId, sourceLabel);
+
+                    NlpDocumentAnalysis nlpAnalysis = sentences.stream()
+                            .filter(StreamChunksResponse::getIsLast)
+                            .filter(StreamChunksResponse::hasNlpAnalysis)
+                            .map(StreamChunksResponse::getNlpAnalysis)
+                            .findFirst().orElse(null);
+
+                    // Phase 1b: Embed sentences for boundary detection
+                    String sentenceModel = params.sentenceEmbeddingModel();
+                    List<StreamEmbeddingsRequest> embedReqs = new ArrayList<>();
+                    for (StreamChunksResponse sent : sentences) {
+                        embedReqs.add(StreamEmbeddingsRequest.newBuilder()
+                                .setRequestId(UUID.randomUUID().toString())
+                                .setDocId(docId)
+                                .setChunkId(sent.getChunkId())
+                                .setTextContent(sent.getTextContent())
+                                .setChunkConfigId("__sentence_boundary__")
+                                .setEmbeddingModelId(sentenceModel)
+                                .build());
+                    }
+
+                    return embedderStreamClient.streamEmbeddings(Multi.createFrom().iterable(embedReqs))
+                            .collect().asList()
+                            .chain(embeddingResponses -> {
+                                // Build ordered sentence vectors matching sentence order
+                                Map<String, StreamEmbeddingsResponse> embedMap = new LinkedHashMap<>();
+                                for (StreamEmbeddingsResponse resp : embeddingResponses) {
+                                    if (resp.getSuccess()) {
+                                        embedMap.put(resp.getChunkId(), resp);
+                                    }
+                                }
+
+                                List<float[]> sentenceVectors = new ArrayList<>();
+                                List<String> sentenceTexts = new ArrayList<>();
+                                List<int[]> sentenceOffsets = new ArrayList<>();
+                                List<StreamChunksResponse> validSentences = new ArrayList<>();
+
+                                for (StreamChunksResponse sent : sentences) {
+                                    StreamEmbeddingsResponse emb = embedMap.get(sent.getChunkId());
+                                    if (emb != null) {
+                                        float[] vec = new float[emb.getVectorCount()];
+                                        for (int i = 0; i < vec.length; i++) {
+                                            vec[i] = emb.getVector(i);
+                                        }
+                                        sentenceVectors.add(vec);
+                                        sentenceTexts.add(sent.getTextContent());
+                                        sentenceOffsets.add(new int[]{sent.getStartOffset(), sent.getEndOffset()});
+                                        validSentences.add(sent);
+                                    }
+                                }
+
+                                if (sentenceVectors.size() <= 1) {
+                                    log.info("Semantic chunking: ≤1 sentence with embeddings for doc {}, treating as single chunk", docId);
+                                }
+
+                                // Phase 1c: Boundary detection
+                                List<Integer> boundaries = SemanticBoundaryDetector.findBoundaries(
+                                        sentenceVectors,
+                                        params.similarityThreshold(),
+                                        params.percentileThreshold());
+
+                                List<List<StreamChunksResponse>> groups =
+                                        SemanticBoundaryDetector.groupByBoundaries(validSentences, boundaries);
+
+                                // Enforce min/max chunk size
+                                float[] allSims = SemanticBoundaryDetector.computeConsecutiveSimilarities(sentenceVectors);
+                                if (params.minChunkSentences() > 1) {
+                                    // Compute boundary similarities for merge decisions
+                                    float[] boundarySims = new float[Math.max(0, groups.size() - 1)];
+                                    int offset = 0;
+                                    for (int g = 0; g < groups.size() - 1; g++) {
+                                        offset += groups.get(g).size();
+                                        int simIdx = Math.min(offset - 1, allSims.length - 1);
+                                        boundarySims[g] = simIdx >= 0 ? allSims[simIdx] : 0f;
+                                    }
+                                    groups = SemanticBoundaryDetector.enforceMinChunkSize(
+                                            groups, boundarySims, params.minChunkSentences());
+                                }
+                                if (params.maxChunkSentences() > 0) {
+                                    groups = SemanticBoundaryDetector.enforceMaxChunkSize(
+                                            groups, allSims, boundaries, params.maxChunkSentences());
+                                }
+
+                                log.info("Semantic chunking: {} boundaries → {} chunks for doc {}",
+                                        boundaries.size(), groups.size(), docId);
+
+                                // Build semantic chunk texts
+                                List<String> chunkTexts = groups.stream()
+                                        .map(g -> g.stream()
+                                                .map(StreamChunksResponse::getTextContent)
+                                                .collect(Collectors.joining(" ")))
+                                        .toList();
+
+                                // Phase 2a: Embed final semantic chunks with each requested embedder
+                                List<Uni<AssemblyOutput>> embedUnis = new ArrayList<>();
+                                for (EmbedderTarget embedTarget : chunkWork.embedderTargets()) {
+                                    List<StreamChunksResponse> syntheticChunks = new ArrayList<>();
+                                    for (int i = 0; i < chunkTexts.size(); i++) {
+                                        syntheticChunks.add(StreamChunksResponse.newBuilder()
+                                                .setRequestId(docId)
+                                                .setDocId(docId)
+                                                .setChunkId(docId + "_semantic_" + i)
+                                                .setChunkNumber(i)
+                                                .setTextContent(chunkTexts.get(i))
+                                                .setChunkConfigId("semantic")
+                                                .setSourceFieldName(sourceLabel)
+                                                .setIsLast(i == chunkTexts.size() - 1)
+                                                .build());
+                                    }
+
+                                    String resultSetName = sourceLabel + "-semantic-" + embedTarget.embedderConfigId();
+                                    embedUnis.add(embedChunks(
+                                            docId, syntheticChunks, "semantic",
+                                            embedTarget.embedderConfigId(),
+                                            embedTarget.embedderConfig(),
+                                            sourceLabel, resultSetName, nodeId, nlpAnalysis));
+                                }
+
+                                // Phase 2b: Build centroid result sets
+                                List<AssemblyOutput> centroidOutputs = new ArrayList<>();
+
+                                if (params.storeSentenceVectors()) {
+                                    // Sentence-level result: reuse vectors from boundary detection
+                                    centroidOutputs.add(assembleResult(
+                                            validSentences, new ArrayList<>(embeddingResponses),
+                                            sourceLabel, "sentence", sentenceModel,
+                                            sourceLabel + "-sentence-" + sentenceModel,
+                                            nodeId, nlpAnalysis));
+                                }
+
+                                if (params.computeCentroids()) {
+                                    centroidOutputs.addAll(buildCentroidResults(
+                                            sentenceVectors, sentenceTexts,
+                                            sentenceOffsets.toArray(new int[0][]),
+                                            sourceText, inputDoc, sourceLabel,
+                                            sentenceModel, nodeId));
+                                }
+
+                                if (embedUnis.isEmpty()) {
+                                    return Uni.createFrom().item(centroidOutputs);
+                                }
+
+                                return Uni.combine().all().unis(embedUnis)
+                                        .with(results -> {
+                                            List<AssemblyOutput> all = new ArrayList<>();
+                                            for (Object r : results) {
+                                                all.add((AssemblyOutput) r);
+                                            }
+                                            all.addAll(centroidOutputs);
+                                            return all;
+                                        });
+                            });
+                });
+    }
+
+    private List<AssemblyOutput> buildCentroidResults(
+            List<float[]> sentenceVectors,
+            List<String> sentenceTexts,
+            int[][] sentenceOffsets,
+            String originalText,
+            PipeDoc inputDoc,
+            String sourceLabel,
+            String embeddingConfigId,
+            String nodeId) {
+
+        List<AssemblyOutput> results = new ArrayList<>();
+
+        // Paragraph centroids
+        List<CentroidComputer.CentroidResult> paragraphCentroids =
+                CentroidComputer.computeParagraphCentroids(
+                        sentenceVectors, sentenceTexts, originalText, sentenceOffsets);
+
+        if (!paragraphCentroids.isEmpty()) {
+            results.add(buildCentroidAssemblyOutput(
+                    paragraphCentroids, "paragraph_centroid",
+                    sourceLabel, embeddingConfigId, nodeId));
+        }
+
+        // Document centroid
+        if (!sentenceVectors.isEmpty()) {
+            CentroidComputer.CentroidResult docCentroid =
+                    CentroidComputer.computeDocumentCentroid(sentenceVectors, originalText);
+            results.add(buildCentroidAssemblyOutput(
+                    List.of(docCentroid), "document_centroid",
+                    sourceLabel, embeddingConfigId, nodeId));
+        }
+
+        return results;
+    }
+
+    private AssemblyOutput buildCentroidAssemblyOutput(
+            List<CentroidComputer.CentroidResult> centroids,
+            String granularity,
+            String sourceLabel,
+            String embeddingConfigId,
+            String nodeId) {
+
+        SemanticProcessingResult.Builder resultBuilder = SemanticProcessingResult.newBuilder()
+                .setResultId(UUID.randomUUID().toString())
+                .setSourceFieldName(sourceLabel)
+                .setChunkConfigId(granularity)
+                .setEmbeddingConfigId(embeddingConfigId)
+                .setResultSetName(sourceLabel + "-" + granularity + "-" + embeddingConfigId)
+                .setCentroidMetadata(CentroidMetadata.newBuilder()
+                        .setGranularity(granularity)
+                        .setSourceVectorCount(centroids.stream()
+                                .mapToInt(CentroidComputer.CentroidResult::sourceVectorCount).sum())
+                        .build());
+
+        if (nodeId != null) {
+            resultBuilder.putMetadata("coordinator_node_id", protoValue(nodeId));
+        }
+
+        for (int i = 0; i < centroids.size(); i++) {
+            CentroidComputer.CentroidResult c = centroids.get(i);
+            ChunkEmbedding.Builder emb = ChunkEmbedding.newBuilder()
+                    .setTextContent(c.text())
+                    .setChunkId(sourceLabel + "_" + granularity + "_" + i)
+                    .setChunkConfigId(granularity);
+            for (float f : c.vector()) {
+                emb.addVector(f);
+            }
+
+            SemanticChunk.Builder chunk = SemanticChunk.newBuilder()
+                    .setChunkId(sourceLabel + "_" + granularity + "_" + i)
+                    .setChunkNumber(i)
+                    .setEmbeddingInfo(emb.build());
+
+            if (c.sectionTitle() != null) {
+                chunk.putMetadata("section_title", protoValue(c.sectionTitle()));
+            }
+
+            resultBuilder.addChunks(chunk.build());
+        }
+
+        return new AssemblyOutput(resultBuilder.build(), null, centroids.size());
     }
 
     private static com.google.protobuf.Value protoValue(String s) {
