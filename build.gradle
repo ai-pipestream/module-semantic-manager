@@ -29,7 +29,7 @@ scmVersion {
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    gitRef = "feat/semantic-chunking"
+    gitRef = "main"
     generateMutiny = true
     generateDescriptors = true
 
