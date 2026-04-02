@@ -173,14 +173,6 @@ public class SemanticManagerGrpcImpl implements PipeStepProcessorService {
     }
 
     @Override
-    public Uni<UpdateBackendEndpointResponse> updateBackendEndpoint(UpdateBackendEndpointRequest request) {
-        return Uni.createFrom().item(UpdateBackendEndpointResponse.newBuilder()
-                .setSuccess(false)
-                .setErrorMessage("Semantic manager has no external backend — chunker and embedder are separate services")
-                .build());
-    }
-
-    @Override
     public Uni<GetServiceRegistrationResponse> getServiceRegistration(GetServiceRegistrationRequest request) {
         log.info("Semantic manager service registration requested");
 
