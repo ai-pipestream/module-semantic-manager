@@ -1321,7 +1321,7 @@ public class SemanticIndexingOrchestrator {
 
         if (!paragraphCentroids.isEmpty()) {
             results.add(buildCentroidAssemblyOutput(
-                    paragraphCentroids, "paragraph_centroid",
+                    paragraphCentroids, "PARAGRAPH",
                     sourceLabel, embeddingConfigId, nodeId, semanticConfigId));
         }
 
@@ -1344,7 +1344,7 @@ public class SemanticIndexingOrchestrator {
 
                 if (!sectionCentroids.isEmpty()) {
                     results.add(buildCentroidAssemblyOutput(
-                            sectionCentroids, "section_centroid",
+                            sectionCentroids, "SECTION",
                             sourceLabel, embeddingConfigId, nodeId, semanticConfigId));
                 }
             }
@@ -1355,7 +1355,7 @@ public class SemanticIndexingOrchestrator {
             CentroidComputer.CentroidResult docCentroid =
                     CentroidComputer.computeDocumentCentroid(sentenceVectors, originalText);
             results.add(buildCentroidAssemblyOutput(
-                    List.of(docCentroid), "document_centroid",
+                    List.of(docCentroid), "DOCUMENT",
                     sourceLabel, embeddingConfigId, nodeId, semanticConfigId));
         }
 
