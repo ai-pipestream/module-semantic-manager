@@ -62,7 +62,7 @@ public class SemanticIndexingOrchestrator {
         if (hasDirectives(inputDoc)) {
             log.info("Using VectorSetDirectives from doc: {} ({} directives)",
                     docId, inputDoc.getSearchMetadata().getVectorSetDirectives().getDirectivesCount());
-            return orchestrateFromDirectives(inputDoc, nodeId);
+            return orchestrateFromDirectives(inputDoc, nodeId, options.hasSemanticConfigId() ? options.semanticConfigId() : null);
         }
 
         // Priority 2: use directives from module config (node custom_config)
@@ -80,7 +80,9 @@ public class SemanticIndexingOrchestrator {
             SemanticManagerOptions implicitOptions = new SemanticManagerOptions(
                     options.indexName(), options.vectorSetIds(),
                     options.maxConcurrentChunkers(), options.maxConcurrentEmbedders(),
-                    java.util.List.of(implicit));
+                    java.util.List.of(implicit),
+                    null, null, null, null, null, null, null,
+                    options.semanticConfigId());
             return orchestrateFromConfigDirectives(inputDoc, implicitOptions, nodeId);
         }
 
@@ -100,7 +102,7 @@ public class SemanticIndexingOrchestrator {
     // Directive-based orchestration (primary path) — 4-phase scatter-gather
     // =========================================================================
 
-    private Uni<PipeDoc> orchestrateFromDirectives(PipeDoc inputDoc, String nodeId) {
+    private Uni<PipeDoc> orchestrateFromDirectives(PipeDoc inputDoc, String nodeId, String semanticConfigId) {
         String docId = inputDoc.getDocId();
         VectorSetDirectives directives = inputDoc.getSearchMetadata().getVectorSetDirectives();
 
@@ -193,7 +195,7 @@ public class SemanticIndexingOrchestrator {
                                 log.info("Routing chunk config '{}' to semantic chunking path for source '{}'",
                                         entry.getKey(), work.sourceLabel());
                                 semanticUnis.add(processSemanticChunkingGroup(
-                                        inputDoc, work, entry.getKey(), entry.getValue(), nodeId));
+                                        inputDoc, work, entry.getKey(), entry.getValue(), nodeId, semanticConfigId));
                             } else {
                                 standardConfigs.put(entry.getKey(), entry.getValue());
                             }
@@ -280,7 +282,7 @@ public class SemanticIndexingOrchestrator {
                                                     docId, chunksForConfig, chunkConfigId,
                                                     et.embedderConfigId(), et.embedderConfig(),
                                                     work.sourceLabel(), resultSetName, nodeId,
-                                                    cr.nlpAnalysis()));
+                                                    cr.nlpAnalysis(), null, null));
                                         }
                                     }
                                 }
@@ -526,7 +528,9 @@ public class SemanticIndexingOrchestrator {
             String sourceFieldName,
             String resultSetName,
             String nodeId,
-            NlpDocumentAnalysis nlpAnalysis) {
+            NlpDocumentAnalysis nlpAnalysis,
+            String semanticConfigId,
+            String semanticGranularity) {
 
         String requestId = UUID.randomUUID().toString();
 
@@ -551,7 +555,8 @@ public class SemanticIndexingOrchestrator {
                 .collect().asList()
                 .map(responses -> assembleResult(
                         chunks, responses, sourceFieldName, chunkConfigId,
-                        embedderConfigId, resultSetName, nodeId, nlpAnalysis));
+                        embedderConfigId, resultSetName, nodeId, nlpAnalysis,
+                        semanticConfigId, semanticGranularity));
     }
 
     // ─── Phase 3: Assemble ───
@@ -670,7 +675,7 @@ public class SemanticIndexingOrchestrator {
                                         List.of(syntheticChunk), responses,
                                         target.sourceLabel(), "field_level",
                                         target.embedderConfigId(), resultSetName, nodeId,
-                                        null);
+                                        null, null, null);
                             })
                             .onFailure().recoverWithItem(error -> {
                                 log.error("Field-level embedder {} failed for doc {}: {}",
@@ -699,6 +704,7 @@ public class SemanticIndexingOrchestrator {
     private Uni<PipeDoc> orchestrateFromConfigDirectives(PipeDoc inputDoc,
                                                           SemanticManagerOptions options,
                                                           String nodeId) {
+        String semanticConfigId = options.hasSemanticConfigId() ? options.semanticConfigId() : null;
         VectorSetDirectives.Builder directivesBuilder = VectorSetDirectives.newBuilder();
 
         for (DirectiveConfig dc : options.directives()) {
@@ -757,7 +763,7 @@ public class SemanticIndexingOrchestrator {
                         .build())
                 .build();
 
-        return orchestrateFromDirectives(docWithDirectives, nodeId);
+        return orchestrateFromDirectives(docWithDirectives, nodeId, semanticConfigId);
     }
 
     // =========================================================================
@@ -825,7 +831,8 @@ public class SemanticIndexingOrchestrator {
                                     .build())
                             .build();
 
-                    return orchestrateFromDirectives(docWithDirectives, nodeId)
+                    String semanticConfigId = options.hasSemanticConfigId() ? options.semanticConfigId() : null;
+                    return orchestrateFromDirectives(docWithDirectives, nodeId, semanticConfigId)
                             .map(enrichedDoc -> {
                                 // Post-process: add VectorSet metadata to results
                                 PipeDoc.Builder docBuilder = enrichedDoc.toBuilder();
@@ -909,7 +916,9 @@ public class SemanticIndexingOrchestrator {
             String embeddingConfigId,
             String resultSetName,
             String nodeId,
-            NlpDocumentAnalysis nlpAnalysis) {
+            NlpDocumentAnalysis nlpAnalysis,
+            String semanticConfigId,
+            String semanticGranularity) {
 
         Map<String, StreamEmbeddingsResponse> embeddingMap = new HashMap<>();
         for (StreamEmbeddingsResponse resp : embeddingResponses) {
@@ -926,6 +935,13 @@ public class SemanticIndexingOrchestrator {
                 .setChunkConfigId(chunkConfigId)
                 .setEmbeddingConfigId(embeddingConfigId)
                 .setResultSetName(resultSetName);
+
+        if (semanticConfigId != null) {
+            resultBuilder.setSemanticConfigId(semanticConfigId);
+        }
+        if (semanticGranularity != null) {
+            resultBuilder.setSemanticGranularity(semanticGranularity);
+        }
 
         if (nodeId != null) {
             resultBuilder.putMetadata("coordinator_node_id", protoValue(nodeId));
@@ -1082,7 +1098,8 @@ public class SemanticIndexingOrchestrator {
             SourceTextWork work,
             String chunkConfigId,
             ChunkConfigWork chunkWork,
-            String nodeId) {
+            String nodeId,
+            String semanticConfigId) {
 
         String docId = inputDoc.getDocId();
         String sourceText = work.sourceText();
@@ -1242,7 +1259,8 @@ public class SemanticIndexingOrchestrator {
                                             docId, syntheticChunks, "semantic",
                                             embedTarget.embedderConfigId(),
                                             embedTarget.embedderConfig(),
-                                            sourceLabel, resultSetName, nodeId, nlpAnalysis));
+                                            sourceLabel, resultSetName, nodeId, nlpAnalysis,
+                                            semanticConfigId, "SEMANTIC_CHUNK"));
                                 }
 
                                 // Phase 2b: Build centroid result sets
@@ -1254,7 +1272,8 @@ public class SemanticIndexingOrchestrator {
                                             validSentences, new ArrayList<>(embeddingResponses),
                                             sourceLabel, "sentence", sentenceModel,
                                             sourceLabel + "-sentence-" + sentenceModel,
-                                            nodeId, nlpAnalysis));
+                                            nodeId, nlpAnalysis,
+                                            semanticConfigId, "SENTENCE"));
                                 }
 
                                 if (params.computeCentroids()) {
@@ -1262,7 +1281,7 @@ public class SemanticIndexingOrchestrator {
                                             sentenceVectors, sentenceTexts,
                                             sentenceOffsets.toArray(new int[0][]),
                                             sourceText, inputDoc, sourceLabel,
-                                            sentenceModel, nodeId));
+                                            sentenceModel, nodeId, semanticConfigId));
                                 }
 
                                 if (embedUnis.isEmpty()) {
@@ -1290,7 +1309,8 @@ public class SemanticIndexingOrchestrator {
             PipeDoc inputDoc,
             String sourceLabel,
             String embeddingConfigId,
-            String nodeId) {
+            String nodeId,
+            String semanticConfigId) {
 
         List<AssemblyOutput> results = new ArrayList<>();
 
@@ -1302,7 +1322,7 @@ public class SemanticIndexingOrchestrator {
         if (!paragraphCentroids.isEmpty()) {
             results.add(buildCentroidAssemblyOutput(
                     paragraphCentroids, "paragraph_centroid",
-                    sourceLabel, embeddingConfigId, nodeId));
+                    sourceLabel, embeddingConfigId, nodeId, semanticConfigId));
         }
 
         // Section centroids — resolve DocOutline from Tika or Docling
@@ -1325,7 +1345,7 @@ public class SemanticIndexingOrchestrator {
                 if (!sectionCentroids.isEmpty()) {
                     results.add(buildCentroidAssemblyOutput(
                             sectionCentroids, "section_centroid",
-                            sourceLabel, embeddingConfigId, nodeId));
+                            sourceLabel, embeddingConfigId, nodeId, semanticConfigId));
                 }
             }
         }
@@ -1336,7 +1356,7 @@ public class SemanticIndexingOrchestrator {
                     CentroidComputer.computeDocumentCentroid(sentenceVectors, originalText);
             results.add(buildCentroidAssemblyOutput(
                     List.of(docCentroid), "document_centroid",
-                    sourceLabel, embeddingConfigId, nodeId));
+                    sourceLabel, embeddingConfigId, nodeId, semanticConfigId));
         }
 
         return results;
@@ -1368,7 +1388,8 @@ public class SemanticIndexingOrchestrator {
             String granularity,
             String sourceLabel,
             String embeddingConfigId,
-            String nodeId) {
+            String nodeId,
+            String semanticConfigId) {
 
         SemanticProcessingResult.Builder resultBuilder = SemanticProcessingResult.newBuilder()
                 .setResultId(UUID.randomUUID().toString())
@@ -1381,6 +1402,11 @@ public class SemanticIndexingOrchestrator {
                         .setSourceVectorCount(centroids.stream()
                                 .mapToInt(CentroidComputer.CentroidResult::sourceVectorCount).sum())
                         .build());
+
+        if (semanticConfigId != null) {
+            resultBuilder.setSemanticConfigId(semanticConfigId);
+            resultBuilder.setSemanticGranularity(granularity.toUpperCase());
+        }
 
         if (nodeId != null) {
             resultBuilder.putMetadata("coordinator_node_id", protoValue(nodeId));

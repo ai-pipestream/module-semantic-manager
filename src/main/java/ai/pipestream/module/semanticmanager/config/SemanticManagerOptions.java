@@ -32,7 +32,8 @@ public record SemanticManagerOptions(
         @JsonProperty("chunk_algorithm") String chunkAlgorithm,
         @JsonProperty("embedding_model") String embeddingModel,
         @JsonProperty("skip_chunking") Boolean skipChunking,
-        @JsonProperty("result_set_name_template") String resultSetNameTemplate
+        @JsonProperty("result_set_name_template") String resultSetNameTemplate,
+        @JsonProperty("semantic_config_id") String semanticConfigId
 ) {
     public static final String DEFAULT_INDEX_NAME = "default-index";
     public static final int DEFAULT_MAX_CONCURRENT_CHUNKERS = 4;
@@ -48,13 +49,13 @@ public record SemanticManagerOptions(
                                   Integer maxConcurrentChunkers, Integer maxConcurrentEmbedders,
                                   List<DirectiveConfig> directives) {
         this(indexName, vectorSetIds, maxConcurrentChunkers, maxConcurrentEmbedders, directives,
-                null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null);
     }
 
     /** Default no-arg constructor. */
     public SemanticManagerOptions() {
         this(DEFAULT_INDEX_NAME, null, DEFAULT_MAX_CONCURRENT_CHUNKERS, DEFAULT_MAX_CONCURRENT_EMBEDDERS,
-                null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null);
     }
 
     public boolean hasDirectives() {
@@ -121,6 +122,10 @@ public record SemanticManagerOptions(
 
     public int effectiveMaxConcurrentEmbedders() {
         return maxConcurrentEmbedders != null ? maxConcurrentEmbedders : DEFAULT_MAX_CONCURRENT_EMBEDDERS;
+    }
+
+    public boolean hasSemanticConfigId() {
+        return semanticConfigId != null && !semanticConfigId.isBlank();
     }
 
     public static String getJsonV7Schema() {
@@ -193,6 +198,10 @@ public record SemanticManagerOptions(
                     "result_set_name_template": {
                       "type": "string",
                       "description": "Convenience: template for result set naming. Placeholders: {source_label}, {chunker_id}, {embedder_id}."
+                    },
+                    "semantic_config_id": {
+                      "type": "string",
+                      "description": "Optional: semantic config ID to stamp on all SemanticProcessingResults produced by this node. Enables downstream grouping by config."
                     }
                   }
                 }
