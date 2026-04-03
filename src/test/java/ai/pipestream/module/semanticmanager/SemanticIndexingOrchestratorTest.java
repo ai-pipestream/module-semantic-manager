@@ -598,7 +598,7 @@ class SemanticIndexingOrchestratorTest {
     void testConvenienceFields_skipChunking_producesFieldLevelResult() {
         SemanticManagerOptions options = new SemanticManagerOptions(
                 "test-index", null, 4, 8, null,
-                "body", null, null, null, "all-MiniLM-L6-v2", true, null);
+                "body", null, null, null, "all-MiniLM-L6-v2", true, null, null);
 
         PipeDoc inputDoc = PipeDoc.newBuilder()
                 .setDocId("convenience-doc")
@@ -634,7 +634,7 @@ class SemanticIndexingOrchestratorTest {
     void testConvenienceFields_withChunking_producesChunkedResult() {
         SemanticManagerOptions options = new SemanticManagerOptions(
                 "test-index", null, 4, 8, null,
-                "body", 200, 20, "SENTENCE", "all-MiniLM-L6-v2", false, null);
+                "body", 200, 20, "SENTENCE", "all-MiniLM-L6-v2", false, null, null);
 
         PipeDoc inputDoc = PipeDoc.newBuilder()
                 .setDocId("convenience-chunk-doc")
@@ -666,7 +666,7 @@ class SemanticIndexingOrchestratorTest {
 
         SemanticManagerOptions options = new SemanticManagerOptions(
                 "test-index", null, 4, 8, List.of(directiveConfig),
-                "title", null, null, null, "some-other-model", true, null);
+                "title", null, null, null, "some-other-model", true, null, null);
 
         PipeDoc inputDoc = PipeDoc.newBuilder()
                 .setDocId("priority-doc-2")

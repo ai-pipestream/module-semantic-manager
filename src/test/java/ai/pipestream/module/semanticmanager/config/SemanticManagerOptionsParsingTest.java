@@ -178,7 +178,7 @@ class SemanticManagerOptionsParsingTest {
     void toImplicitDirective_skipChunking_noChunkerConfigs() {
         SemanticManagerOptions opts = new SemanticManagerOptions(
                 null, null, null, null, null,
-                "body", null, null, null, "all-MiniLM-L6-v2", true, null);
+                "body", null, null, null, "all-MiniLM-L6-v2", true, null, null);
 
         DirectiveConfig dc = opts.toImplicitDirective();
 
@@ -195,7 +195,7 @@ class SemanticManagerOptionsParsingTest {
     void toImplicitDirective_withChunking_hasChunkerConfig() {
         SemanticManagerOptions opts = new SemanticManagerOptions(
                 null, null, null, null, null,
-                "body", 300, 30, "SENTENCE", "all-MiniLM-L6-v2", false, null);
+                "body", 300, 30, "SENTENCE", "all-MiniLM-L6-v2", false, null, null);
 
         DirectiveConfig dc = opts.toImplicitDirective();
 
@@ -213,7 +213,7 @@ class SemanticManagerOptionsParsingTest {
     void toImplicitDirective_allNull_usesConventionDefaults() {
         SemanticManagerOptions opts = new SemanticManagerOptions(
                 null, null, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null);
 
         DirectiveConfig dc = opts.toImplicitDirective();
 
@@ -234,7 +234,7 @@ class SemanticManagerOptionsParsingTest {
         SemanticManagerOptions opts = new SemanticManagerOptions(
                 null, null, null, null, null,
                 "body", null, null, null, "model1", true,
-                "{source_label}_custom_{embedder_id}");
+                "{source_label}_custom_{embedder_id}", null);
 
         DirectiveConfig dc = opts.toImplicitDirective();
         assertThat(dc.fieldNameTemplate()).as("custom template preserved")
@@ -254,7 +254,7 @@ class SemanticManagerOptionsParsingTest {
 
         SemanticManagerOptions opts = new SemanticManagerOptions(
                 "idx", null, 4, 8, List.of(directive),
-                "title", 300, 30, "SENTENCE", "other-model", true, null);
+                "title", 300, 30, "SENTENCE", "other-model", true, null, null);
 
         assertThat(opts.hasDirectives()).as("explicit directives present").isTrue();
         assertThat(opts.hasConvenienceFields()).as("convenience fields also present").isTrue();
